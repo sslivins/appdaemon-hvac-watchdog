@@ -7,11 +7,24 @@ boards running the gysmo38/mitsubishi2MQTT firmware) and:
    in Home Assistant, how long it stays down, and how many times it has been
    rebooted. Stats persist to ``state.json`` (survives AppDaemon reloads) and are
    optionally republished as ``sensor.*`` entities so they can be graphed.
-2. **Auto-recovers via REST** - when a unit stays ``unavailable`` past a grace
-   period (suspected firmware lock-up), the app logs in to the board's web UI and
-   hits ``GET /reboot`` to power-cycle the ESP32. A cooldown plus a cap on
-   consecutive reboots prevents reboot loops; once the cap is hit the app stops
-   and (optionally) fires a notification instead.
+2. **Auto-recovers via REST** - a unit is considered "needs a reboot" when it
+   either (a) stays ``unavailable`` past ``unavailable_grace_seconds``, or
+   (b) *flaps* - bouncing to ``unavailable`` ``flap_threshold`` times within
+   ``flap_window_seconds`` (a flapper never stays down long enough to trip the
+   grace timer, but it is just as broken). The app then logs in to the board's
+   web UI and hits ``GET /reboot`` to power-cycle the ESP32. A cooldown plus a
+   cap on consecutive reboots prevents reboot loops.
+
+The reboot escalation counter only resets once a unit has been **continuously
+online for ``stable_seconds``** - so a flapping unit (whose constant brief
+"recoveries" would otherwise reset it forever) keeps escalating until it is
+stable or the app gives up.
+
+**Notifications** (optional ``notify_service``) are sent only when action is
+taken or needed: after a **successful reboot**, when a reboot **could not be
+performed** (board unreachable / HTTP error), and when the app **gives up** after
+rebooting ``max_consecutive_reboots`` times without the unit becoming stable.
+No notifications are sent for routine unavailable/recovery transitions.
 
 The mitsubishi2MQTT web UI uses cookie auth with a hard-coded username ``admin``
 and a static session cookie ``M2MSESSIONID=1`` set on a successful
@@ -54,6 +67,13 @@ class HvacWatchdog(hass.Hass):
         self.grace_seconds = int(self.args.get("unavailable_grace_seconds", 300))
         self.cooldown_seconds = int(self.args.get("reboot_cooldown_seconds", 300))
         self.max_reboots = int(self.args.get("max_consecutive_reboots", 3))
+        # Flapping: this many unavailable transitions within the window is
+        # treated as "needs a reboot" even if it never stays down for `grace`.
+        self.flap_threshold = int(self.args.get("flap_threshold", 3))
+        self.flap_window = int(self.args.get("flap_window_seconds", 120))
+        # A unit must be continuously online this long before its reboot
+        # escalation (consecutive count / gave-up) is reset.
+        self.stable_seconds = int(self.args.get("stable_seconds", 300))
         self.http_timeout = int(self.args.get("http_timeout_seconds", 10))
         self.reboot_enabled = bool(self.args.get("reboot_enabled", True))
         self.publish_sensors = bool(self.args.get("publish_sensors", True))
@@ -88,11 +108,15 @@ class HvacWatchdog(hass.Hass):
         self.stats = self._load_stats()
 
         # --- Runtime (not persisted) ------------------------------------
-        # Per entity: grace_handle, cooldown_until (epoch), consecutive_reboots,
-        # gave_up (bool).
         self._runtime = {
-            e: {"grace_handle": None, "cooldown_until": 0.0,
-                "consecutive_reboots": 0, "gave_up": False}
+            e: {
+                "grace_handle": None,
+                "stable_handle": None,
+                "cooldown_until": 0.0,
+                "consecutive_reboots": 0,
+                "gave_up": False,
+                "flap_times": [],   # epochs of recent unavailable transitions
+            }
             for e in self.devices
         }
 
@@ -107,22 +131,24 @@ class HvacWatchdog(hass.Hass):
         # Baseline current state without counting a phantom transition. If a
         # device is already down at startup, begin a grace countdown.
         now = time.time()
-        for entity, dev in self.devices.items():
+        for entity in self.devices:
             cur = self.get_state(entity)
             if self._is_down(cur):
                 st = self.stats[entity]
                 if not st.get("unavailable_since"):
                     st["unavailable_since"] = now
                     st["last_unavailable_ts"] = self._iso(now)
-                self._arm_grace(entity, "startup")
+                self._arm_grace(entity)
             self._publish(entity)
         self._save_stats()
 
         self.log(
             "Initialized. devices=%d grace=%ds cooldown=%ds max_reboots=%d "
-            "reboot_enabled=%s down_states=%s"
+            "flap=%d/%ds stable=%ds reboot_enabled=%s notify=%s down_states=%s"
             % (len(self.devices), self.grace_seconds, self.cooldown_seconds,
-               self.max_reboots, self.reboot_enabled, sorted(self.down_states))
+               self.max_reboots, self.flap_threshold, self.flap_window,
+               self.stable_seconds, self.reboot_enabled,
+               self.notify_service or "<none>", sorted(self.down_states))
         )
 
     # ------------------------------------------------------------------ #
@@ -143,11 +169,31 @@ class HvacWatchdog(hass.Hass):
             st["unavailable_count"] = st.get("unavailable_count", 0) + 1
             st["unavailable_since"] = now
             st["last_unavailable_ts"] = self._iso(now)
+            count = st["unavailable_count"]
             self._save_stats_locked()
+
+        rt = self._runtime[entity]
+        # It dropped again, so it isn't stable - cancel any pending stability
+        # confirmation (don't let a flapper reset its escalation).
+        self._cancel_stable(entity)
+
+        # Record this drop for flap detection and prune old entries.
+        rt["flap_times"].append(now)
+        rt["flap_times"] = [t for t in rt["flap_times"]
+                            if now - t <= self.flap_window]
+        flaps = len(rt["flap_times"])
+
+        if flaps >= self.flap_threshold:
+            self.log("%s is FLAPPING (%d drops in <=%ds, total count=%d) - "
+                     "treating as reboot-necessary."
+                     % (entity, flaps, self.flap_window, count))
+            self._cancel_grace(entity)
+            self._maybe_reboot(entity, "flapping")
+            return
+
         self.log("%s went UNAVAILABLE (count=%d). Reboot in %ds if it stays down."
-                 % (entity, self.stats[entity]["unavailable_count"],
-                    self.grace_seconds))
-        self._arm_grace(entity, "went_down")
+                 % (entity, count, self.grace_seconds))
+        self._arm_grace(entity)
         self._publish(entity)
 
     def _on_came_back(self, entity, new):
@@ -161,42 +207,73 @@ class HvacWatchdog(hass.Hass):
             st["unavailable_since"] = None
             st["last_available_ts"] = self._iso(now)
             self._save_stats_locked()
-        # A clean recovery resets the reboot escalation.
+
+        # Don't reset the reboot escalation yet - a flapper "recovers"
+        # constantly. Only a sustained period of being online (stable_seconds)
+        # counts as a real recovery (see _confirm_stable).
+        self._cancel_grace(entity)
+        self._arm_stable(entity)
+        self.log("%s back online (state=%s). Confirming stable for %ds."
+                 % (entity, new, self.stable_seconds))
+        self._publish(entity)
+
+    def _confirm_stable(self, kwargs):
+        entity = kwargs["entity"]
+        self._runtime[entity]["stable_handle"] = None
+        if self._is_down(self.get_state(entity)):
+            return  # dropped again before we got here
         rt = self._runtime[entity]
+        if rt["consecutive_reboots"] or rt["gave_up"] or rt["flap_times"]:
+            self.log("%s stable for %ds - clearing reboot escalation."
+                     % (entity, self.stable_seconds))
         rt["consecutive_reboots"] = 0
         rt["gave_up"] = False
         rt["cooldown_until"] = 0.0
-        self._cancel_grace(entity)
-        self.log("%s back ONLINE (state=%s). Reset reboot escalation." %
-                 (entity, new))
+        rt["flap_times"] = []
         self._publish(entity)
 
     # ------------------------------------------------------------------ #
-    # Reboot escalation
+    # Timers
     # ------------------------------------------------------------------ #
-    def _arm_grace(self, entity, reason):
-        """(Re)schedule the grace check for a device, replacing any pending one."""
+    def _arm_grace(self, entity):
         self._cancel_grace(entity)
         self._runtime[entity]["grace_handle"] = self.run_in(
-            self._grace_expired, self.grace_seconds, entity=entity, reason=reason)
+            self._grace_expired, self.grace_seconds, entity=entity)
 
     def _cancel_grace(self, entity):
-        handle = self._runtime[entity].get("grace_handle")
+        self._cancel_handle(entity, "grace_handle")
+
+    def _arm_stable(self, entity):
+        self._cancel_stable(entity)
+        self._runtime[entity]["stable_handle"] = self.run_in(
+            self._confirm_stable, self.stable_seconds, entity=entity)
+
+    def _cancel_stable(self, entity):
+        self._cancel_handle(entity, "stable_handle")
+
+    def _cancel_handle(self, entity, key):
+        handle = self._runtime[entity].get(key)
         if handle is not None:
             try:
                 self.cancel_timer(handle)
             except Exception:  # noqa: BLE001
                 pass
-            self._runtime[entity]["grace_handle"] = None
+            self._runtime[entity][key] = None
 
     def _grace_expired(self, kwargs):
         entity = kwargs["entity"]
         self._runtime[entity]["grace_handle"] = None
-
         # Recovered while we waited - nothing to do (handler already cleaned up).
         if not self._is_down(self.get_state(entity)):
             return
+        self._maybe_reboot(entity, "unavailable")
 
+    # ------------------------------------------------------------------ #
+    # Reboot escalation
+    # ------------------------------------------------------------------ #
+    def _maybe_reboot(self, entity, reason):
+        """Gate-keeper: decide whether a reboot is allowed right now, honouring
+        cooldown, the give-up flag, and the consecutive-reboot cap."""
         rt = self._runtime[entity]
         if rt["gave_up"]:
             return
@@ -205,64 +282,81 @@ class HvacWatchdog(hass.Hass):
         if now < rt["cooldown_until"]:
             # Still settling after a reboot; re-check when the cooldown ends.
             remaining = max(1, int(rt["cooldown_until"] - now))
+            self._cancel_grace(entity)
             self._runtime[entity]["grace_handle"] = self.run_in(
-                self._grace_expired, remaining, entity=entity, reason="cooldown")
+                self._grace_expired, remaining, entity=entity)
             return
 
         if not self.reboot_enabled:
-            self.log("%s still down but reboot_enabled=false - not rebooting."
-                     % entity, level="WARNING")
-            self._arm_grace(entity, "disabled-recheck")
+            self.log("%s needs a reboot (%s) but reboot_enabled=false."
+                     % (entity, reason), level="WARNING")
             return
 
         if rt["consecutive_reboots"] >= self.max_reboots:
             rt["gave_up"] = True
-            msg = ("%s still UNAVAILABLE after %d reboot attempts - giving up "
-                   "(manual intervention needed)."
-                   % (entity, rt["consecutive_reboots"]))
+            name = self.devices[entity]["name"]
+            msg = ("HVAC %s (%s) still unstable after %d reboots - manual "
+                   "intervention needed." % (name, entity,
+                                             rt["consecutive_reboots"]))
             self.log(msg, level="ERROR")
             self._notify(msg)
             self._publish(entity)
             return
 
-        self._attempt_reboot(entity)
+        self._do_reboot(entity, reason)
 
-    def _attempt_reboot(self, entity):
+    def _do_reboot(self, entity, reason):
+        """Actually send the reboot, update stats, notify, and schedule the
+        post-reboot re-check."""
         dev = self.devices[entity]
-        host = self._resolve_host(entity)
+        name = dev["name"]
         rt = self._runtime[entity]
+        host = self._resolve_host(entity)
+        now = time.time()
+        rt["consecutive_reboots"] += 1
+        rt["cooldown_until"] = now + self.cooldown_seconds
+        attempt = rt["consecutive_reboots"]
+
         if not host:
-            self.log("%s: no host/IP resolved - cannot reboot." % entity,
-                     level="WARNING")
-            rt["consecutive_reboots"] += 1  # count as an attempt to honour the cap
+            self.log("%s: no host/IP resolved - cannot reboot (attempt %d/%d)."
+                     % (entity, attempt, self.max_reboots), level="WARNING")
+            self._notify("HVAC %s (%s) is %s but I can't reboot it: no IP "
+                         "resolved. Attempt %d of %d."
+                         % (name, entity, reason, attempt, self.max_reboots))
             self._schedule_post_reboot(entity)
+            self._publish(entity)
             return
 
         ok, detail = self._reboot_http(host)
-        rt["consecutive_reboots"] += 1
-        now = time.time()
-        rt["cooldown_until"] = now + self.cooldown_seconds
         if ok:
             with self._lock:
                 st = self.stats[entity]
                 st["reboot_count"] = st.get("reboot_count", 0) + 1
                 st["last_reboot_ts"] = self._iso(now)
                 self._save_stats_locked()
-            self.log("%s: reboot #%d sent to %s (%s). Re-checking in %ds."
-                     % (entity, rt["consecutive_reboots"], host, detail,
+            self.log("%s: reboot #%d sent to %s (%s, reason=%s). Re-check in %ds."
+                     % (entity, attempt, host, detail, reason,
                         self.cooldown_seconds))
+            self._notify("HVAC %s (%s) was %s - rebooted it (%s, attempt %d of "
+                         "%d)." % (name, entity, reason, host, attempt,
+                                   self.max_reboots))
         else:
-            self.log("%s: reboot attempt #%d to %s FAILED (%s). Re-checking in %ds."
-                     % (entity, rt["consecutive_reboots"], host, detail,
-                        self.cooldown_seconds), level="WARNING")
+            self.log("%s: reboot attempt #%d to %s FAILED (%s, reason=%s). "
+                     "Re-check in %ds." % (entity, attempt, host, detail, reason,
+                                           self.cooldown_seconds),
+                     level="WARNING")
+            self._notify("HVAC %s (%s) is %s but the reboot FAILED (%s: %s). "
+                         "Attempt %d of %d." % (name, entity, reason, host,
+                                                detail, attempt, self.max_reboots))
         self._schedule_post_reboot(entity)
         self._publish(entity)
 
     def _schedule_post_reboot(self, entity):
+        """After a reboot, re-check once the cooldown elapses; if still down it
+        will reboot again (up to the cap)."""
         self._cancel_grace(entity)
         self._runtime[entity]["grace_handle"] = self.run_in(
-            self._grace_expired, self.cooldown_seconds, entity=entity,
-            reason="post-reboot")
+            self._grace_expired, self.cooldown_seconds, entity=entity)
 
     def _reboot_http(self, host):
         """POST /login then GET /reboot. Returns (ok, detail)."""
@@ -309,7 +403,7 @@ class HvacWatchdog(hass.Hass):
                          level="WARNING")
                 continue
             self.log("Manual reboot requested for %s." % entity)
-            self._attempt_reboot(entity)
+            self._do_reboot(entity, "manual")
 
     def _notify(self, message):
         if not self.notify_service:

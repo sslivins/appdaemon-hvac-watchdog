@@ -15,26 +15,40 @@ drops to `unavailable` in Home Assistant.
    `unavailable`, how long it stays down (total downtime), and how many times it
    has been rebooted. Stats persist to `state.json` so they survive AppDaemon
    reloads, and are optionally republished as `sensor.*` entities you can graph.
-2. **Auto-recovers via REST.** When a unit stays `unavailable` past a grace
-   period, the app logs in to the board's web UI and issues `GET /reboot` to
-   power-cycle the ESP32. A cooldown and a cap on consecutive reboots prevent
-   reboot loops; once the cap is hit it stops and (optionally) fires a
-   notification instead.
+2. **Auto-recovers via REST.** A unit is considered "needs a reboot" when it
+   either (a) stays `unavailable` past the grace period, or (b) **flaps** -
+   bouncing to `unavailable` `flap_threshold` times within `flap_window_seconds`
+   (a flapper never stays down long enough to trip the grace timer, but it's
+   just as broken). The app then logs in to the board's web UI and issues
+   `GET /reboot` to power-cycle the ESP32. A cooldown and a cap on consecutive
+   reboots prevent reboot loops; once the cap is hit it stops and notifies.
+
+The reboot escalation counter only resets once a unit has been **continuously
+online for `stable_seconds`** - so a flapping unit (whose constant brief
+"recoveries" would otherwise reset it forever) keeps escalating until it is
+genuinely stable or the app gives up.
+
+### Notifications
+
+If `notify_service` is set, a notification is sent **only when action is taken
+or needed** - never for routine availability changes:
+
+- after a **successful reboot**,
+- when a reboot **could not be performed** (board unreachable / HTTP error),
+- when the app **gives up** after `max_consecutive_reboots` without the unit
+  becoming stable.
 
 ### Recovery flow
 
 ```
-unavailable ---(stays down unavailable_grace_seconds)---> reboot
-   ^                                                         |
-   |                                                         v
- recover <----(re-check after reboot_cooldown_seconds)--- still down?
-   |                                                         |
-   | reset escalation                          up to max_consecutive_reboots,
-   |                                              then notify + give up
+unavailable --(stays down grace, OR flaps flap_threshold x in flap_window)--> reboot
+   ^                                                                            |
+   |                                                                            v
+ stable for <----(online stable_seconds, no further drops)--- re-check after cooldown
+ stable_seconds                                                                 |
+   |                                                            up to max_consecutive_reboots,
+   | clear escalation                                             then notify + give up
 ```
-
-A clean recovery (the unit returning to a normal state) resets the escalation,
-so the next outage starts fresh.
 
 ## Authentication
 
@@ -84,12 +98,15 @@ logger, remove the `log:` line from `hvac_watchdog.yaml`.
 | `password` | Web UI password, via `!secret` from `secrets.yaml`. |
 | `unavailable_grace_seconds` | How long a unit must stay down before rebooting (default 300). |
 | `reboot_cooldown_seconds` | Wait after a reboot before re-checking/rebooting again (default 300). |
-| `max_consecutive_reboots` | Stop + notify after this many reboots without recovery (default 3). |
+| `max_consecutive_reboots` | Stop + notify after this many reboots without the unit becoming stable (default 3). |
+| `flap_threshold` | Drops within `flap_window_seconds` that count as flapping = reboot-necessary (default 3). |
+| `flap_window_seconds` | Sliding window for flap detection (default 120). |
+| `stable_seconds` | Continuous-online time required before the reboot escalation resets (default 300). |
 | `http_timeout_seconds` | Per-request HTTP timeout to a board (default 10). |
 | `reboot_enabled` | `false` = only track availability, never reboot (default `true`). |
 | `publish_sensors` | Publish `sensor.*` stats (default `true`). |
 | `sensor_prefix` | Prefix for the published sensors (default `hvac_watchdog`). |
-| `notify_service` | Optional `notify.*` service called when a unit can't be recovered. |
+| `notify_service` | Optional `notify.*` service; alerts on successful reboot, failed reboot, and give-up. |
 | `unavailable_states` | States that count as "down" (default `unavailable`, `unknown`). |
 | `devices[]` | `entity` + `host` (IP); optional `tracker` (device_tracker for a live `ip`) and `name`. |
 

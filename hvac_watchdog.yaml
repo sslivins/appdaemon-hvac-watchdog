@@ -17,9 +17,19 @@ hvac_watchdog:
   # After a reboot, wait this long (boot + Wi-Fi/MQTT reconnect) before
   # re-checking / rebooting again.
   reboot_cooldown_seconds: 300
-  # Stop after this many consecutive reboots without recovery, then notify
-  # instead of looping. The counter resets the moment the unit comes back.
+  # Stop after this many consecutive reboots without the unit becoming stable,
+  # then notify instead of looping.
   max_consecutive_reboots: 3
+  # Flapping detection: a unit that bounces to "unavailable" this many times
+  # within flap_window_seconds is treated as "needs a reboot" right away (it
+  # never stays down long enough to trip the grace timer, but it's just as
+  # broken).
+  flap_threshold: 3
+  flap_window_seconds: 120
+  # A unit must stay continuously online this long before its reboot escalation
+  # (consecutive count / gave-up) is cleared. Keeps a flapper - which "recovers"
+  # constantly - escalating until it is genuinely stable.
+  stable_seconds: 300
   # Per-request HTTP timeout when talking to a board.
   http_timeout_seconds: 10
   # Master switch: set false to only track availability (never auto-reboot).
@@ -31,10 +41,13 @@ hvac_watchdog:
   publish_sensors: true
   sensor_prefix: hvac_watchdog
 
-  # --- Notification on give-up (optional) --------------------------------
-  # A notify.* service to call when a unit can't be recovered after
-  # max_consecutive_reboots. Leave unset to only log.
-  # notify_service: notify.mobile_app_your_phone
+  # --- Notifications (optional) ------------------------------------------
+  # A notify.* service called only when action is taken or needed: after a
+  # successful reboot, when a reboot can't be performed (board unreachable),
+  # and when the app gives up after max_consecutive_reboots. No notifications
+  # are sent for routine unavailable/recovery transitions. Leave unset to only
+  # log.
+  notify_service: notify.mobile_app_stefan
 
   # States that count as "the unit is down".
   unavailable_states:
