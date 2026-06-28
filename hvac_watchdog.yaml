@@ -1,0 +1,65 @@
+hvac_watchdog:
+  module: hvac_watchdog
+  class: HvacWatchdog
+  log: hvac_watchdog_log
+
+  # --- Auth for the mitsubishi2MQTT web UI -------------------------------
+  # Username is hard-coded to "admin" in the firmware; only the password is a
+  # secret. Keep the real value in secrets.yaml (this folder, gitignored) and
+  # reference it with !secret. Copy secrets.yaml.example to get started.
+  username: "admin"
+  password: !secret mitsubishi_web_password
+
+  # --- Recovery policy ---------------------------------------------------
+  # How long a unit must stay "unavailable" before we reboot it (rides out
+  # brief MQTT blips).
+  unavailable_grace_seconds: 300
+  # After a reboot, wait this long (boot + Wi-Fi/MQTT reconnect) before
+  # re-checking / rebooting again.
+  reboot_cooldown_seconds: 300
+  # Stop after this many consecutive reboots without recovery, then notify
+  # instead of looping. The counter resets the moment the unit comes back.
+  max_consecutive_reboots: 3
+  # Per-request HTTP timeout when talking to a board.
+  http_timeout_seconds: 10
+  # Master switch: set false to only track availability (never auto-reboot).
+  reboot_enabled: true
+
+  # --- HA sensors --------------------------------------------------------
+  # Publish sensor.<prefix>_<name>_status / _unavailable_count / _reboots so
+  # the stats can be graphed. Set publish_sensors: false to disable.
+  publish_sensors: true
+  sensor_prefix: hvac_watchdog
+
+  # --- Notification on give-up (optional) --------------------------------
+  # A notify.* service to call when a unit can't be recovered after
+  # max_consecutive_reboots. Leave unset to only log.
+  # notify_service: notify.mobile_app_your_phone
+
+  # States that count as "the unit is down".
+  unavailable_states:
+    - unavailable
+    - unknown
+
+  # --- Devices -----------------------------------------------------------
+  # Each unit: the climate entity to watch + the board's IP (host). Optional
+  # `tracker` (a device_tracker) is consulted for a live `ip` attribute first
+  # for DHCP resilience, falling back to `host`. `name` is used for sensor ids
+  # and logs (defaults to the entity's object_id).
+  devices:
+    - entity: climate.master_bedroom
+      host: 192.168.1.181
+      tracker: device_tracker.hvac_master
+      name: master_bedroom
+    - entity: climate.eric_s_bedroom
+      host: 192.168.1.203
+      tracker: device_tracker.hvac_bedroomb
+      name: eric_bedroom
+    - entity: climate.natalie_s_room
+      host: 192.168.1.96
+      tracker: device_tracker.hvac_twins
+      name: natalie_room
+    - entity: climate.twins_bedroom
+      host: 192.168.1.227
+      tracker: device_tracker.hvac_bedroomc
+      name: twins_bedroom

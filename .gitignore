@@ -1,0 +1,28 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment directories
+venv/
+.env/
+env/
+
+# Ignore AppDaemon logs and temporary files
+logs/
+*.log
+*.log.[0-9]*
+
+# Ignore sensitive files
+secrets.yaml
+
+# Ignore IDE/editor specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# App runtime state
+state.json
