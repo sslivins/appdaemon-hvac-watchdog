@@ -7,24 +7,28 @@ boards running the gysmo38/mitsubishi2MQTT firmware) and:
    in Home Assistant, how long it stays down, and how many times it has been
    rebooted. Stats persist to ``state.json`` (survives AppDaemon reloads) and are
    optionally republished as ``sensor.*`` entities so they can be graphed.
-2. **Auto-recovers via REST** - a unit is considered "needs a reboot" when it
-   either (a) stays ``unavailable`` past ``unavailable_grace_seconds``, or
-   (b) *flaps* - bouncing to ``unavailable`` ``flap_threshold`` times within
-   ``flap_window_seconds`` (a flapper never stays down long enough to trip the
-   grace timer, but it is just as broken). The app then logs in to the board's
-   web UI and hits ``GET /reboot`` to power-cycle the ESP32. A cooldown plus a
-   cap on consecutive reboots prevents reboot loops.
+2. **Auto-recovers via REST** - a unit is rebooted when it stays ``unavailable``
+   past ``unavailable_grace_seconds`` (the firmware sometimes gets *stuck*
+   unavailable; a power-cycle fixes that). The app logs in to the board's web UI
+   and hits ``GET /reboot`` to power-cycle the ESP. A cooldown plus a cap on
+   consecutive reboots prevents reboot loops.
+3. **Flap detection (notify-only)** - a unit that *bounces* to ``unavailable``
+   ``flap_threshold`` times within ``flap_window_seconds`` is **not** rebooted
+   (flapping is a Wi-Fi/power problem a reboot doesn't fix). Instead the app
+   sends a single, **rate-limited** heads-up (at most once per
+   ``flap_notify_interval_seconds`` per device, default 24 h). A flapper still
+   gets the normal grace timer, so if it stops bouncing and stays down it is
+   still rebooted as a sustained outage.
 
 The reboot escalation counter only resets once a unit has been **continuously
-online for ``stable_seconds``** - so a flapping unit (whose constant brief
-"recoveries" would otherwise reset it forever) keeps escalating until it is
-stable or the app gives up.
+online for ``stable_seconds``**.
 
 **Notifications** (optional ``notify_service``) are sent only when action is
 taken or needed: after a **successful reboot**, when a reboot **could not be
-performed** (board unreachable / HTTP error), and when the app **gives up** after
-rebooting ``max_consecutive_reboots`` times without the unit becoming stable.
-No notifications are sent for routine unavailable/recovery transitions.
+performed** (board unreachable / HTTP error), when the app **gives up** after
+rebooting ``max_consecutive_reboots`` times, and a rate-limited heads-up when a
+unit is **flapping**. No notifications are sent for routine unavailable/recovery
+transitions.
 
 The mitsubishi2MQTT web UI uses cookie auth with a hard-coded username ``admin``
 and a static session cookie ``M2MSESSIONID=1`` set on a successful
@@ -69,9 +73,13 @@ class HvacWatchdog(hass.Hass):
         self.cooldown_seconds = int(self.args.get("reboot_cooldown_seconds", 300))
         self.max_reboots = int(self.args.get("max_consecutive_reboots", 3))
         # Flapping: this many unavailable transitions within the window is
-        # treated as "needs a reboot" even if it never stays down for `grace`.
+        # treated as "flapping". Flappers are NOT rebooted (a reboot doesn't fix
+        # a Wi-Fi/power problem) - they only trigger a rate-limited notification.
         self.flap_threshold = int(self.args.get("flap_threshold", 3))
         self.flap_window = int(self.args.get("flap_window_seconds", 120))
+        # At most one "is flapping" notification per device per this interval.
+        self.flap_notify_interval = int(
+            self.args.get("flap_notify_interval_seconds", 86400))
         # A unit must be continuously online this long before its reboot
         # escalation (consecutive count / gave-up) is reset.
         self.stable_seconds = int(self.args.get("stable_seconds", 300))
@@ -125,6 +133,7 @@ class HvacWatchdog(hass.Hass):
                 "consecutive_reboots": 0,
                 "gave_up": False,
                 "flap_times": [],   # epochs of recent unavailable transitions
+                "flap_last_notify": 0.0,  # epoch of last flap notification
             }
             for e in self.devices
         }
@@ -160,12 +169,12 @@ class HvacWatchdog(hass.Hass):
 
         self.log(
             "Initialized. devices=%d grace=%ds cooldown=%ds max_reboots=%d "
-            "flap=%d/%ds stable=%ds reboot_enabled=%s notify=%s fw_check=%s "
-            "down_states=%s"
+            "flap=%d/%ds(notify-only,<=1/%ds) stable=%ds reboot_enabled=%s "
+            "notify=%s fw_check=%s down_states=%s"
             % (len(self.devices), self.grace_seconds, self.cooldown_seconds,
                self.max_reboots, self.flap_threshold, self.flap_window,
-               self.stable_seconds, self.reboot_enabled,
-               self.notify_service or "<none>",
+               self.flap_notify_interval, self.stable_seconds,
+               self.reboot_enabled, self.notify_service or "<none>",
                ("%s@%s day=%s" % (self.fw_repo, self.fw_time, self.fw_day))
                if self.fw_enabled else "off",
                sorted(self.down_states))
@@ -204,12 +213,14 @@ class HvacWatchdog(hass.Hass):
         flaps = len(rt["flap_times"])
 
         if flaps >= self.flap_threshold:
+            # Flapping is a Wi-Fi/power problem a reboot won't fix, so we only
+            # notify (rate-limited) and never reboot a flapper. It still gets the
+            # normal grace timer below, so a flapper that stops bouncing and
+            # stays down is still rebooted as a sustained outage.
             self.log("%s is FLAPPING (%d drops in <=%ds, total count=%d) - "
-                     "treating as reboot-necessary."
-                     % (entity, flaps, self.flap_window, count))
-            self._cancel_grace(entity)
-            self._maybe_reboot(entity, "flapping")
-            return
+                     "notify only, not rebooting."
+                     % (entity, flaps, self.flap_window, count), level="WARNING")
+            self._maybe_notify_flap(entity, flaps)
 
         self.log("%s went UNAVAILABLE (count=%d). Reboot in %ds if it stays down."
                  % (entity, count, self.grace_seconds))
@@ -427,6 +438,22 @@ class HvacWatchdog(hass.Hass):
                 continue
             self.log("Manual reboot requested for %s." % entity)
             self._do_reboot(entity, "manual")
+
+    def _maybe_notify_flap(self, entity, flaps):
+        """Send a flapping heads-up, rate-limited to at most one per
+        ``flap_notify_interval`` seconds per device. Flappers are never
+        rebooted, so this is the only signal that a unit is bouncing."""
+        rt = self._runtime[entity]
+        now = time.time()
+        if now - rt.get("flap_last_notify", 0.0) < self.flap_notify_interval:
+            return
+        rt["flap_last_notify"] = now
+        name = self.devices[entity]["name"]
+        mins = max(1, self.flap_window // 60)
+        self._notify(
+            "HVAC %s (%s) is FLAPPING (%d drops in ~%d min) - likely a "
+            "Wi-Fi/power issue, not rebooting. Worth checking the unit."
+            % (name, entity, flaps, mins))
 
     def _notify(self, message):
         if not self.notify_service:

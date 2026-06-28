@@ -21,11 +21,15 @@ hvac_watchdog:
   # then notify instead of looping.
   max_consecutive_reboots: 3
   # Flapping detection: a unit that bounces to "unavailable" this many times
-  # within flap_window_seconds is treated as "needs a reboot" right away (it
-  # never stays down long enough to trip the grace timer, but it's just as
-  # broken).
+  # within flap_window_seconds is treated as "flapping". Flappers are NOT
+  # rebooted (a reboot doesn't fix a Wi-Fi/power problem) - they only trigger a
+  # rate-limited notification. A flapper still gets the normal grace timer, so
+  # if it stops bouncing and stays down it is still rebooted as a real outage.
   flap_threshold: 3
   flap_window_seconds: 600
+  # At most one "is flapping" notification per device per this interval
+  # (default 86400 = once per day) so a chronic flapper doesn't spam you.
+  flap_notify_interval_seconds: 86400
   # A unit must stay continuously online this long before its reboot escalation
   # (consecutive count / gave-up) is cleared. Keeps a flapper - which "recovers"
   # constantly - escalating until it is genuinely stable.

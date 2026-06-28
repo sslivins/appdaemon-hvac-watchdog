@@ -15,18 +15,21 @@ drops to `unavailable` in Home Assistant.
    `unavailable`, how long it stays down (total downtime), and how many times it
    has been rebooted. Stats persist to `state.json` so they survive AppDaemon
    reloads, and are optionally republished as `sensor.*` entities you can graph.
-2. **Auto-recovers via REST.** A unit is considered "needs a reboot" when it
-   either (a) stays `unavailable` past the grace period, or (b) **flaps** -
-   bouncing to `unavailable` `flap_threshold` times within `flap_window_seconds`
-   (a flapper never stays down long enough to trip the grace timer, but it's
-   just as broken). The app then logs in to the board's web UI and issues
-   `GET /reboot` to power-cycle the ESP32. A cooldown and a cap on consecutive
+2. **Auto-recovers via REST.** A unit is rebooted when it stays `unavailable`
+   past the grace period (the firmware sometimes gets *stuck* unavailable; a
+   power-cycle fixes that). The app logs in to the board's web UI and issues
+   `GET /reboot` to power-cycle the ESP. A cooldown and a cap on consecutive
    reboots prevent reboot loops; once the cap is hit it stops and notifies.
+3. **Flap detection (notify-only).** A unit that **flaps** - bouncing to
+   `unavailable` `flap_threshold` times within `flap_window_seconds` - is **not**
+   rebooted, because flapping is a Wi-Fi/power problem a reboot doesn't fix.
+   Instead the app sends a single **rate-limited** heads-up (at most once per
+   `flap_notify_interval_seconds` per device, default 24 h). A flapper still gets
+   the normal grace timer, so if it stops bouncing and stays down it is still
+   rebooted as a sustained outage.
 
 The reboot escalation counter only resets once a unit has been **continuously
-online for `stable_seconds`** - so a flapping unit (whose constant brief
-"recoveries" would otherwise reset it forever) keeps escalating until it is
-genuinely stable or the app gives up.
+online for `stable_seconds`**.
 
 ### Notifications
 
@@ -36,18 +39,22 @@ or needed** - never for routine availability changes:
 - after a **successful reboot**,
 - when a reboot **could not be performed** (board unreachable / HTTP error),
 - when the app **gives up** after `max_consecutive_reboots` without the unit
-  becoming stable.
+  becoming stable,
+- a **rate-limited** heads-up when a unit is **flapping** (at most once per
+  `flap_notify_interval_seconds` per device).
 
 ### Recovery flow
 
 ```
-unavailable --(stays down grace, OR flaps flap_threshold x in flap_window)--> reboot
+unavailable --(stays down past grace)----------------------------------------> reboot
    ^                                                                            |
    |                                                                            v
  stable for <----(online stable_seconds, no further drops)--- re-check after cooldown
  stable_seconds                                                                 |
    |                                                            up to max_consecutive_reboots,
    | clear escalation                                             then notify + give up
+
+flapping (flap_threshold drops in flap_window) --> notify only (<=1/day), no reboot
 ```
 
 ## Authentication
@@ -99,14 +106,15 @@ logger, remove the `log:` line from `hvac_watchdog.yaml`.
 | `unavailable_grace_seconds` | How long a unit must stay down before rebooting (default 300). |
 | `reboot_cooldown_seconds` | Wait after a reboot before re-checking/rebooting again (default 300). |
 | `max_consecutive_reboots` | Stop + notify after this many reboots without the unit becoming stable (default 3). |
-| `flap_threshold` | Drops within `flap_window_seconds` that count as flapping = reboot-necessary (default 3). |
+| `flap_threshold` | Drops within `flap_window_seconds` that count as flapping (notify-only, never rebooted; default 3). |
 | `flap_window_seconds` | Sliding window for flap detection (default 120). |
+| `flap_notify_interval_seconds` | Min seconds between flap notifications per device (default 86400 = once/day). |
 | `stable_seconds` | Continuous-online time required before the reboot escalation resets (default 300). |
 | `http_timeout_seconds` | Per-request HTTP timeout to a board (default 10). |
 | `reboot_enabled` | `false` = only track availability, never reboot (default `true`). |
 | `publish_sensors` | Publish `sensor.*` stats (default `true`). |
 | `sensor_prefix` | Prefix for the published sensors (default `hvac_watchdog`). |
-| `notify_service` | Optional `notify.*` service; alerts on successful reboot, failed reboot, and give-up. |
+| `notify_service` | Optional `notify.*` service; alerts on successful reboot, failed reboot, give-up, and (rate-limited) flapping. |
 | `unavailable_states` | States that count as "down" (default `unavailable`, `unknown`). |
 | `devices[]` | `entity` + `host` (IP); optional `tracker` (device_tracker for a live `ip`) and `name`. |
 
