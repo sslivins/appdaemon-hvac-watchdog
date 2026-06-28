@@ -37,6 +37,7 @@ app's YAML config (with the password supplied via ``!secret``).
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -86,6 +87,14 @@ class HvacWatchdog(hass.Hass):
                                                  ["unavailable", "unknown"]))
         }
 
+        # --- Firmware update check (optional) ---------------------------
+        fw = self.args.get("firmware_check", {}) or {}
+        self.fw_enabled = bool(fw.get("enabled", False))
+        self.fw_repo = str(fw.get("repo", "gysmo38/mitsubishi2MQTT"))
+        self.fw_time = fw.get("check_time", "09:00:00")
+        # Weekday to run on (mon..sun); null/omitted = every day.
+        self.fw_day = self._parse_weekday(fw.get("check_day", "sun"))
+
         # --- Devices ----------------------------------------------------
         # Each: {entity, host, [tracker], [name]}. `host` is the static IP;
         # optional `tracker` (a device_tracker) is consulted for a live `ip`
@@ -128,6 +137,13 @@ class HvacWatchdog(hass.Hass):
         # with data {"entity": "climate.master_bedroom"} (or "all").
         self.listen_event(self._on_manual_reboot, "hvac_watchdog_reboot")
 
+        # Weekly firmware-update check (optional). run_daily fires every day at
+        # the time; the callback no-ops on days other than fw_day.
+        if self.fw_enabled:
+            self.run_daily(self._firmware_check, self.parse_time(self.fw_time))
+        # Manual firmware check for testing: fire event "hvac_watchdog_fwcheck".
+        self.listen_event(self._on_manual_fwcheck, "hvac_watchdog_fwcheck")
+
         # Baseline current state without counting a phantom transition. If a
         # device is already down at startup, begin a grace countdown.
         now = time.time()
@@ -144,11 +160,15 @@ class HvacWatchdog(hass.Hass):
 
         self.log(
             "Initialized. devices=%d grace=%ds cooldown=%ds max_reboots=%d "
-            "flap=%d/%ds stable=%ds reboot_enabled=%s notify=%s down_states=%s"
+            "flap=%d/%ds stable=%ds reboot_enabled=%s notify=%s fw_check=%s "
+            "down_states=%s"
             % (len(self.devices), self.grace_seconds, self.cooldown_seconds,
                self.max_reboots, self.flap_threshold, self.flap_window,
                self.stable_seconds, self.reboot_enabled,
-               self.notify_service or "<none>", sorted(self.down_states))
+               self.notify_service or "<none>",
+               ("%s@%s day=%s" % (self.fw_repo, self.fw_time, self.fw_day))
+               if self.fw_enabled else "off",
+               sorted(self.down_states))
         )
 
     # ------------------------------------------------------------------ #
@@ -419,6 +439,80 @@ class HvacWatchdog(hass.Hass):
             self.log("Notify failed: %s" % exc, level="WARNING")
 
     # ------------------------------------------------------------------ #
+    # Firmware update check
+    # ------------------------------------------------------------------ #
+    def _on_manual_fwcheck(self, event_name, data, kwargs):
+        self.log("Manual firmware check requested.")
+        self._firmware_check({"force": True})
+
+    def _firmware_check(self, kwargs):
+        # run_daily fires every day; only proceed on the configured weekday
+        # (unless this was a manual/forced check or no day is configured).
+        if (not kwargs.get("force") and self.fw_day is not None
+                and self.datetime().weekday() != self.fw_day):
+            return
+
+        latest = self._github_latest_tag()
+        if not latest:
+            self.log("Firmware check: couldn't fetch latest release from %s."
+                     % self.fw_repo, level="WARNING")
+            return
+        latest_t = self._ver_tuple(latest)
+
+        behind, unreadable = [], []
+        for entity, dev in self.devices.items():
+            host = self._resolve_host(entity)
+            ver = self._read_installed_version(host) if host else None
+            if not ver:
+                unreadable.append(dev["name"])
+                continue
+            if self._ver_tuple(ver) < latest_t:
+                behind.append((dev["name"], ver))
+
+        if behind:
+            lst = ", ".join("%s (on %s)" % (n, v) for n, v in behind)
+            msg = ("Mitsubishi HVAC firmware %s is available. Behind: %s. "
+                   "Update at https://github.com/%s/releases"
+                   % (latest, lst, self.fw_repo))
+            self.log(msg)
+            self._notify(msg)
+        else:
+            self.log("Firmware check: all readable units up to date (latest %s)."
+                     % latest)
+        if unreadable:
+            self.log("Firmware check: couldn't read version for: %s."
+                     % ", ".join(unreadable), level="WARNING")
+
+    def _github_latest_tag(self):
+        url = "https://api.github.com/repos/%s/releases/latest" % self.fw_repo
+        try:
+            r = requests.get(url, timeout=self.http_timeout,
+                             headers={"Accept": "application/vnd.github+json",
+                                      "User-Agent": "hvac_watchdog"})
+            if r.status_code == 200:
+                return r.json().get("tag_name")
+            self.log("Firmware check: GitHub API HTTP %d." % r.status_code,
+                     level="WARNING")
+        except (requests.RequestException, ValueError) as exc:
+            self.log("Firmware check: GitHub API error: %s" % type(exc).__name__,
+                     level="WARNING")
+        return None
+
+    def _read_installed_version(self, host):
+        """Read the running firmware version off the board's web UI root page."""
+        base = "http://%s" % host
+        try:
+            s = requests.Session()
+            s.cookies.set("M2MSESSIONID", "1")
+            r = s.get(base + "/", timeout=self.http_timeout, allow_redirects=True)
+            m = re.search(r"\d{4}\.\d+\.\d+", r.text)
+            if m:
+                return m.group(0)
+        except requests.RequestException:
+            pass
+        return None
+
+    # ------------------------------------------------------------------ #
     # HA sensors
     # ------------------------------------------------------------------ #
     def _publish(self, entity):
@@ -512,6 +606,22 @@ class HvacWatchdog(hass.Hass):
     @staticmethod
     def _iso(epoch):
         return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_weekday(value):
+        """Map a weekday name (mon..sun) to 0..6. None/unknown -> None (= any
+        day)."""
+        if value is None:
+            return None
+        days = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5,
+                "sun": 6}
+        return days.get(str(value).strip().lower()[:3])
+
+    @staticmethod
+    def _ver_tuple(s):
+        """Turn a version string like '2024.8.0' into a comparable int tuple."""
+        parts = re.findall(r"\d+", str(s))
+        return tuple(int(p) for p in parts) if parts else (0,)
 
     @staticmethod
     def _as_list(value):

@@ -54,6 +54,18 @@ hvac_watchdog:
     - unavailable
     - unknown
 
+  # --- Firmware update check (optional) ----------------------------------
+  # Once a week, check the GitHub repo for a newer release and notify (via
+  # notify_service) if any unit's installed firmware is behind. The installed
+  # version is read from each board's web UI. Runs at check_time, but only on
+  # check_day (set check_day: null to check every day). Fire the event
+  # "hvac_watchdog_fwcheck" to run it on demand.
+  firmware_check:
+    enabled: true
+    repo: gysmo38/mitsubishi2MQTT
+    check_day: sun
+    check_time: "09:00:00"
+
   # --- Devices -----------------------------------------------------------
   # Each unit: the climate entity to watch + the board's IP (host). Optional
   # `tracker` (a device_tracker) is consulted for a live `ip` attribute first

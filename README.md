@@ -122,6 +122,22 @@ Each carries attributes: `host`, `source_entity`, `total_unavailable_seconds`,
 `last_unavailable`, `last_available`, `last_reboot`, `consecutive_reboots`,
 `gave_up`.
 
+## Firmware update check
+
+Optionally (`firmware_check.enabled: true`) the app checks the GitHub repo once a
+week for a newer release and notifies you (via `notify_service`) if any unit's
+installed firmware is behind. The installed version is read from each board's web
+UI; the latest release comes from the GitHub releases API. The version tuple
+comparison handles the date-style tags (e.g. `2024.8.0`).
+
+It runs at `check_time` on `check_day` only (default **Sunday 09:00**) so you get
+at most a weekly nudge, not daily spam. Set `check_day: null` to check every day.
+Fire the event `hvac_watchdog_fwcheck` to run a check on demand:
+
+```yaml
+event_type: hvac_watchdog_fwcheck
+```
+
 ## Manual reboot (testing)
 
 Fire the event `hvac_watchdog_reboot` to reboot on demand without waiting for an
