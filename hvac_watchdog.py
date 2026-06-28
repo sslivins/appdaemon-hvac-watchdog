@@ -315,6 +315,9 @@ class HvacWatchdog(hass.Hass):
         now = time.time()
         rt["consecutive_reboots"] += 1
         rt["cooldown_until"] = now + self.cooldown_seconds
+        # Start flap detection fresh after a reboot so stale pre-reboot drops
+        # don't immediately re-trigger once the cooldown ends.
+        rt["flap_times"] = []
         attempt = rt["consecutive_reboots"]
 
         if not host:

@@ -25,7 +25,7 @@ hvac_watchdog:
   # never stays down long enough to trip the grace timer, but it's just as
   # broken).
   flap_threshold: 3
-  flap_window_seconds: 120
+  flap_window_seconds: 600
   # A unit must stay continuously online this long before its reboot escalation
   # (consecutive count / gave-up) is cleared. Keeps a flapper - which "recovers"
   # constantly - escalating until it is genuinely stable.
