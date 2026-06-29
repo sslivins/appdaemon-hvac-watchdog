@@ -80,6 +80,7 @@ class HvacWatchdog(hass.Hass):
         # At most one "is flapping" notification per device per this interval.
         self.flap_notify_interval = int(
             self.args.get("flap_notify_interval_seconds", 86400))
+        self.flap_notify_enabled = bool(self.args.get("flap_notify_enabled", True))
         # A unit must be continuously online this long before its reboot
         # escalation (consecutive count / gave-up) is reset.
         self.stable_seconds = int(self.args.get("stable_seconds", 300))
@@ -445,6 +446,8 @@ class HvacWatchdog(hass.Hass):
         rebooted, so this is the only signal that a unit is bouncing."""
         rt = self._runtime[entity]
         now = time.time()
+        if not self.flap_notify_enabled:
+            return
         if now - rt.get("flap_last_notify", 0.0) < self.flap_notify_interval:
             return
         rt["flap_last_notify"] = now

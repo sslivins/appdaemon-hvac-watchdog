@@ -30,6 +30,8 @@ hvac_watchdog:
   # At most one "is flapping" notification per device per this interval
   # (default 86400 = once per day) so a chronic flapper doesn't spam you.
   flap_notify_interval_seconds: 86400
+  # Set false to silence flapping notifications entirely (too noisy).
+  flap_notify_enabled: false
   # A unit must stay continuously online this long before its reboot escalation
   # (consecutive count / gave-up) is cleared. Keeps a flapper - which "recovers"
   # constantly - escalating until it is genuinely stable.
