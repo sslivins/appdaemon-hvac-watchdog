@@ -1,7 +1,8 @@
 """HVAC Watchdog - AppDaemon app.
 
 Monitors a set of Mitsubishi mini-split ``climate.*`` entities (driven by ESP32
-boards running the gysmo38/mitsubishi2MQTT firmware) and:
+boards running either the legacy gysmo38/mitsubishi2MQTT firmware or the newer
+sslivins/mitsubishi-heatpump firmware) and:
 
 1. **Tracks availability** - counts how often each unit drops to ``unavailable``
    in Home Assistant, how long it stays down, and how many times it has been
@@ -30,13 +31,25 @@ rebooting ``max_consecutive_reboots`` times, and a rate-limited heads-up when a
 unit is **flapping**. No notifications are sent for routine unavailable/recovery
 transitions.
 
-The mitsubishi2MQTT web UI uses cookie auth with a hard-coded username ``admin``
-and a static session cookie ``M2MSESSIONID=1`` set on a successful
-``POST /login``. We both POST the login form and set the cookie explicitly, then
-``GET /reboot``.
+Two firmware flavours are supported, selected per-device via ``firmware:``
+(default ``mitsubishi2mqtt``):
+
+* ``mitsubishi2mqtt`` (legacy) - the web UI uses cookie auth with a hard-coded
+  username ``admin`` and a static session cookie ``M2MSESSIONID=1`` set on a
+  successful ``POST /login``. We both POST the login form and set the cookie
+  explicitly, then ``GET /reboot``. Version is scraped from the root HTML page.
+* ``heatpump`` (sslivins/mitsubishi-heatpump) - a JSON REST API. Reboot is
+  ``POST /api/system/restart``; version comes from ``GET /api/status`` (the
+  ``version`` field). When the board has web auth enabled, requests carry an
+  ``X-API-Key`` header (per-device ``api_key:``); with auth disabled the API is
+  open and no key is needed.
+
+The firmware-update check compares each unit against the latest GitHub release
+of *its* firmware repo (``gysmo38/mitsubishi2MQTT`` or
+``sslivins/mitsubishi-heatpump`` by default; overridable per firmware).
 
 No entity IDs, hosts, or secrets are hard-coded - everything comes from the
-app's YAML config (with the password supplied via ``!secret``).
+app's YAML config (with passwords/keys supplied via ``!secret``).
 """
 
 import json
@@ -61,6 +74,12 @@ _PERSIST_FIELDS = (
     "reboot_count",
     "last_reboot_ts",
 )
+
+# Supported firmware flavours -> default GitHub repo for the update check.
+_DEFAULT_FW_REPOS = {
+    "mitsubishi2mqtt": "gysmo38/mitsubishi2MQTT",
+    "heatpump": "sslivins/mitsubishi-heatpump",
+}
 
 
 class HvacWatchdog(hass.Hass):
@@ -99,23 +118,39 @@ class HvacWatchdog(hass.Hass):
         # --- Firmware update check (optional) ---------------------------
         fw = self.args.get("firmware_check", {}) or {}
         self.fw_enabled = bool(fw.get("enabled", False))
-        self.fw_repo = str(fw.get("repo", "gysmo38/mitsubishi2MQTT"))
+        # Per-firmware GitHub repos. Back-compat: a bare `repo:` overrides the
+        # legacy mitsubishi2mqtt repo; `repos:` is a {firmware: repo} mapping.
+        self.fw_repos = dict(_DEFAULT_FW_REPOS)
+        if fw.get("repo"):
+            self.fw_repos["mitsubishi2mqtt"] = str(fw["repo"])
+        for k, v in (fw.get("repos", {}) or {}).items():
+            self.fw_repos[str(k).strip().lower()] = str(v)
         self.fw_time = fw.get("check_time", "09:00:00")
         # Weekday to run on (mon..sun); null/omitted = every day.
         self.fw_day = self._parse_weekday(fw.get("check_day", "sun"))
 
         # --- Devices ----------------------------------------------------
-        # Each: {entity, host, [tracker], [name]}. `host` is the static IP;
-        # optional `tracker` (a device_tracker) is consulted for a live `ip`
-        # attribute first (DHCP resilience), falling back to `host`.
+        # Each: {entity, host, [tracker], [name], [firmware], [api_key]}.
+        # `host` is the static IP; optional `tracker` (a device_tracker) is
+        # consulted for a live `ip` attribute first (DHCP resilience), falling
+        # back to `host`. `firmware` selects the reboot/version protocol
+        # ("mitsubishi2mqtt" default, or "heatpump"); `api_key` is sent as
+        # X-API-Key to a heatpump board that has web auth enabled.
         self.devices = {}
         for d in self._as_list(self.args.get("devices", [])):
             entity = d["entity"]
+            fw_type = str(d.get("firmware", "mitsubishi2mqtt")).strip().lower()
+            if fw_type not in _DEFAULT_FW_REPOS:
+                self.log("Device %s: unknown firmware '%s' - defaulting to "
+                         "mitsubishi2mqtt." % (entity, fw_type), level="WARNING")
+                fw_type = "mitsubishi2mqtt"
             self.devices[entity] = {
                 "entity": entity,
                 "host": d.get("host"),
                 "tracker": d.get("tracker"),
                 "name": d.get("name") or entity.split(".")[-1],
+                "firmware": fw_type,
+                "api_key": d.get("api_key"),
             }
 
         # --- Persistence ------------------------------------------------
@@ -362,7 +397,7 @@ class HvacWatchdog(hass.Hass):
             self._publish(entity)
             return
 
-        ok, detail = self._reboot_http(host)
+        ok, detail = self._reboot_http(host, dev)
         if ok:
             with self._lock:
                 st = self.stats[entity]
@@ -393,8 +428,14 @@ class HvacWatchdog(hass.Hass):
         self._runtime[entity]["grace_handle"] = self.run_in(
             self._grace_expired, self.cooldown_seconds, entity=entity)
 
-    def _reboot_http(self, host):
-        """POST /login then GET /reboot. Returns (ok, detail)."""
+    def _reboot_http(self, host, dev):
+        """Dispatch a reboot to the right firmware protocol. Returns (ok, detail)."""
+        if dev.get("firmware") == "heatpump":
+            return self._reboot_heatpump(host, dev)
+        return self._reboot_m2m(host)
+
+    def _reboot_m2m(self, host):
+        """mitsubishi2MQTT: POST /login then GET /reboot. Returns (ok, detail)."""
         base = "http://%s" % host
         try:
             s = requests.Session()
@@ -411,6 +452,23 @@ class HvacWatchdog(hass.Hass):
             r = s.get(base + "/reboot", timeout=self.http_timeout,
                       allow_redirects=False)
             # The board reboots ~500ms after responding; a 2xx/3xx means accepted.
+            if r.status_code < 400:
+                return True, "HTTP %d" % r.status_code
+            return False, "HTTP %d" % r.status_code
+        except requests.RequestException as exc:
+            return False, type(exc).__name__
+
+    def _reboot_heatpump(self, host, dev):
+        """sslivins/mitsubishi-heatpump: POST /api/system/restart. Sends the
+        X-API-Key header when an api_key is configured (only needed if the board
+        has web auth enabled). Returns (ok, detail)."""
+        headers = {"User-Agent": "hvac_watchdog"}
+        if dev.get("api_key"):
+            headers["X-API-Key"] = dev["api_key"]
+        try:
+            r = requests.post("http://%s/api/system/restart" % host,
+                              headers=headers, timeout=self.http_timeout)
+            # The board restarts ~500ms after responding; 2xx means accepted.
             if r.status_code < 400:
                 return True, "HTTP %d" % r.status_code
             return False, "HTTP %d" % r.status_code
@@ -482,54 +540,66 @@ class HvacWatchdog(hass.Hass):
                 and self.datetime().weekday() != self.fw_day):
             return
 
-        latest = self._github_latest_tag()
-        if not latest:
-            self.log("Firmware check: couldn't fetch latest release from %s."
-                     % self.fw_repo, level="WARNING")
-            return
-        latest_t = self._ver_tuple(latest)
-
+        latest_by_repo = {}   # repo -> (tag, ver_tuple), or None if fetch failed
         behind, unreadable = [], []
         for entity, dev in self.devices.items():
+            repo = self.fw_repos.get(dev["firmware"])
+            if not repo:
+                continue
+            if repo not in latest_by_repo:
+                tag = self._github_latest_tag(repo)
+                latest_by_repo[repo] = (tag, self._ver_tuple(tag)) if tag else None
+                if latest_by_repo[repo] is None:
+                    self.log("Firmware check: couldn't fetch latest release from "
+                             "%s." % repo, level="WARNING")
+            latest = latest_by_repo[repo]
+            if latest is None:
+                continue
+
             host = self._resolve_host(entity)
-            ver = self._read_installed_version(host) if host else None
+            ver = self._read_installed_version(host, dev) if host else None
             if not ver:
                 unreadable.append(dev["name"])
                 continue
-            if self._ver_tuple(ver) < latest_t:
-                behind.append((dev["name"], ver))
+            if self._ver_tuple(ver) < latest[1]:
+                behind.append((dev["name"], ver, latest[0], repo))
 
         if behind:
-            lst = ", ".join("%s (on %s)" % (n, v) for n, v in behind)
-            msg = ("Mitsubishi HVAC firmware %s is available. Behind: %s. "
-                   "Update at https://github.com/%s/releases"
-                   % (latest, lst, self.fw_repo))
+            lst = ", ".join(
+                "%s (on %s -> %s, https://github.com/%s/releases)"
+                % (n, v, lt, repo) for n, v, lt, repo in behind)
+            msg = "Mitsubishi HVAC firmware update available. Behind: %s." % lst
             self.log(msg)
             self._notify(msg)
         else:
-            self.log("Firmware check: all readable units up to date (latest %s)."
-                     % latest)
+            self.log("Firmware check: all readable units up to date.")
         if unreadable:
             self.log("Firmware check: couldn't read version for: %s."
                      % ", ".join(unreadable), level="WARNING")
 
-    def _github_latest_tag(self):
-        url = "https://api.github.com/repos/%s/releases/latest" % self.fw_repo
+    def _github_latest_tag(self, repo):
+        url = "https://api.github.com/repos/%s/releases/latest" % repo
         try:
             r = requests.get(url, timeout=self.http_timeout,
                              headers={"Accept": "application/vnd.github+json",
                                       "User-Agent": "hvac_watchdog"})
             if r.status_code == 200:
                 return r.json().get("tag_name")
-            self.log("Firmware check: GitHub API HTTP %d." % r.status_code,
-                     level="WARNING")
+            self.log("Firmware check: GitHub API HTTP %d for %s."
+                     % (r.status_code, repo), level="WARNING")
         except (requests.RequestException, ValueError) as exc:
-            self.log("Firmware check: GitHub API error: %s" % type(exc).__name__,
-                     level="WARNING")
+            self.log("Firmware check: GitHub API error for %s: %s"
+                     % (repo, type(exc).__name__), level="WARNING")
         return None
 
-    def _read_installed_version(self, host):
-        """Read the running firmware version off the board's web UI root page."""
+    def _read_installed_version(self, host, dev):
+        """Read the running firmware version, using the device's protocol."""
+        if dev.get("firmware") == "heatpump":
+            return self._read_version_heatpump(host, dev)
+        return self._read_version_m2m(host)
+
+    def _read_version_m2m(self, host):
+        """mitsubishi2MQTT: scrape the version off the web UI root page."""
         base = "http://%s" % host
         try:
             s = requests.Session()
@@ -539,6 +609,20 @@ class HvacWatchdog(hass.Hass):
             if m:
                 return m.group(0)
         except requests.RequestException:
+            pass
+        return None
+
+    def _read_version_heatpump(self, host, dev):
+        """heatpump: GET /api/status returns JSON with a "version" field."""
+        headers = {"User-Agent": "hvac_watchdog"}
+        if dev.get("api_key"):
+            headers["X-API-Key"] = dev["api_key"]
+        try:
+            r = requests.get("http://%s/api/status" % host, headers=headers,
+                             timeout=self.http_timeout)
+            if r.status_code == 200:
+                return r.json().get("version")
+        except (requests.RequestException, ValueError):
             pass
         return None
 

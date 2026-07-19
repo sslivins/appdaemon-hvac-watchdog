@@ -2,7 +2,9 @@
 
 An [AppDaemon](https://appdaemon.readthedocs.io/) app for Home Assistant that
 **watches a set of Mitsubishi mini-split `climate.*` entities** (driven by ESP32
-boards running the [gysmo38/mitsubishi2MQTT](https://github.com/gysmo38/mitsubishi2MQTT)
+boards running either the legacy
+[gysmo38/mitsubishi2MQTT](https://github.com/gysmo38/mitsubishi2MQTT) firmware or
+the newer [sslivins/mitsubishi-heatpump](https://github.com/sslivins/mitsubishi-heatpump)
 firmware) and automatically recovers them when the firmware locks up and the unit
 drops to `unavailable` in Home Assistant.
 
@@ -57,13 +59,25 @@ unavailable --(stays down past grace)----------------------------------------> r
 flapping (flap_threshold drops in flap_window) --> notify only (<=1/day), no reboot
 ```
 
-## Authentication
+## Firmware flavours & authentication
 
-The mitsubishi2MQTT web UI uses cookie auth with a **hard-coded username
-`admin`** and a static session cookie `M2MSESSIONID=1` set on a successful
-`POST /login`. The app POSTs the login form (`USERNAME` / `PASSWORD`) and also
-sets the cookie explicitly, then calls `GET /reboot`. All four units typically
-share the same web password.
+Each device declares its firmware via the per-device `firmware:` key (default
+`mitsubishi2mqtt`). The reboot and version-check protocol differs per flavour:
+
+| `firmware` | Repo | Reboot | Version |
+| --- | --- | --- | --- |
+| `mitsubishi2mqtt` (default) | `gysmo38/mitsubishi2MQTT` | `POST /login` then `GET /reboot` | scraped from web-UI root HTML |
+| `heatpump` | `sslivins/mitsubishi-heatpump` | `POST /api/system/restart` | `GET /api/status` → JSON `version` |
+
+- **mitsubishi2mqtt** uses cookie auth with a **hard-coded username `admin`** and
+  a static session cookie `M2MSESSIONID=1` set on a successful `POST /login`. The
+  app POSTs the login form (`USERNAME` / `PASSWORD`) and also sets the cookie
+  explicitly, then calls `GET /reboot`. These units typically share one web
+  password (`password:` at the app level).
+- **heatpump** is a JSON REST API. When the board has web auth enabled, requests
+  carry an `X-API-Key` header from the per-device `api_key:` (keep it in
+  `secrets.yaml` via `!secret`). If the board has auth disabled the API is open
+  and no key is needed.
 
 ## Installation
 
@@ -101,8 +115,8 @@ logger, remove the `log:` line from `hvac_watchdog.yaml`.
 
 | Key | What it is |
 | --- | --- |
-| `username` | Web UI username (firmware hard-codes `admin`). |
-| `password` | Web UI password, via `!secret` from `secrets.yaml`. |
+| `username` | Web UI username for `mitsubishi2mqtt` boards (firmware hard-codes `admin`). |
+| `password` | Web UI password for `mitsubishi2mqtt` boards, via `!secret` from `secrets.yaml`. |
 | `unavailable_grace_seconds` | How long a unit must stay down before rebooting (default 300). |
 | `reboot_cooldown_seconds` | Wait after a reboot before re-checking/rebooting again (default 300). |
 | `max_consecutive_reboots` | Stop + notify after this many reboots without the unit becoming stable (default 3). |
@@ -116,7 +130,7 @@ logger, remove the `log:` line from `hvac_watchdog.yaml`.
 | `sensor_prefix` | Prefix for the published sensors (default `hvac_watchdog`). |
 | `notify_service` | Optional `notify.*` service; alerts on successful reboot, failed reboot, give-up, and (rate-limited) flapping. |
 | `unavailable_states` | States that count as "down" (default `unavailable`, `unknown`). |
-| `devices[]` | `entity` + `host` (IP); optional `tracker` (device_tracker for a live `ip`) and `name`. |
+| `devices[]` | `entity` + `host` (IP); optional `tracker` (device_tracker for a live `ip`), `name`, `firmware` (`mitsubishi2mqtt` default or `heatpump`), and `api_key` (heatpump boards with web auth on). |
 
 ### Published sensors
 
@@ -132,11 +146,15 @@ Each carries attributes: `host`, `source_entity`, `total_unavailable_seconds`,
 
 ## Firmware update check
 
-Optionally (`firmware_check.enabled: true`) the app checks the GitHub repo once a
-week for a newer release and notifies you (via `notify_service`) if any unit's
-installed firmware is behind. The installed version is read from each board's web
-UI; the latest release comes from the GitHub releases API. The version tuple
-comparison handles the date-style tags (e.g. `2024.8.0`).
+Optionally (`firmware_check.enabled: true`) the app checks GitHub once a week for
+a newer release and notifies you (via `notify_service`) if any unit's installed
+firmware is behind. Each unit is compared against the latest release of **its own
+firmware repo** (`gysmo38/mitsubishi2MQTT` or `sslivins/mitsubishi-heatpump` by
+default; override per firmware with `firmware_check.repos:`). The installed
+version is read from each board (web-UI HTML for `mitsubishi2mqtt`, `GET
+/api/status` for `heatpump`); the latest release comes from the GitHub releases
+API. The version-tuple comparison handles both the legacy date-style tags (e.g.
+`2024.8.0`) and semver tags with a `v` prefix (e.g. `v0.2.59`).
 
 It runs at `check_time` on `check_day` only (default **Sunday 09:00**) so you get
 at most a weekly nudge, not daily spam. Set `check_day: null` to check every day.
